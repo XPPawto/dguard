@@ -1,21 +1,16 @@
 {
   "name": "driveguard-server",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "version": "2.0.0",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
   "dependencies": {
-    "better-sqlite3": "^13.0.3",
-    "cors": "^2.8.6",
-    "dotenv": "^17.4.2",
-    "express": "^5.2.1",
-    "express-rate-limit": "^8.7.0",
-    "helmet": "^8.3.0",
-    "node-telegram-bot-api": "^2.1.0"
-  }
+    "sqlite3": "5.1.7",
+    "cors": "2.8.5",
+    "dotenv": "16.4.7",
+    "express": "4.21.2",
+    "express-rate-limit": "7.5.0",
+    "helmet": "7.2.0",
+    "node-telegram-bot-api": "0.64.0"
+  },
+  "engines": { "node": ">=18" }
 }
