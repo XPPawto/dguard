@@ -104,9 +104,11 @@ const logEvent = (event, ip, ua, detail) =>
 
 // ─── State ────────────────────────────────────────────────────────────────────
 let globalLocked   = false;
-let lockReason     = null;   // 'manual' (via /lock, permanen) atau 'auto' (gagal berkali-kali, expired 15 menit)
+let lockReason     = null;
 let autoUnlockTimer = null;
+let notifMuted     = false;  // kalau true, notif "Drive Dibuka" tidak dikirim (tetap kirim fail/lock)
 const activeSessions = new Set();
+const sessionMeta   = new Map(); // token -> { createdAt, ip }
 
 function setAutoLock() {
   globalLocked = true;
@@ -226,7 +228,9 @@ app.post("/api/drive-opened", checkKey, async (req, res) => {
     const { ua } = req.body;
     const ip = getIP(req);
     logEvent("DRIVE_OPENED", ip, ua, "");
-    tgSend(`🔔 <b>Drive Dibuka</b>\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>\n📱 UA: <code>${(ua||"").slice(0,60)}</code>`);
+    if (!notifMuted) {
+      tgSend(`🔔 <b>Drive Dibuka</b>\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>\n📱 UA: <code>${(ua||"").slice(0,60)}</code>`);
+    }
     res.json({ ok:true, locked:globalLocked });
   } catch (e) {
     console.error("[/api/drive-opened] error:", e);
@@ -315,6 +319,7 @@ app.post("/api/verify-otp", authLimiter, checkKey, async (req, res) => {
     await dbRun("INSERT INTO sessions (token,created,expires) VALUES (?,?,?)",
       [token, new Date().toISOString(), expires]);
     activeSessions.add(token);
+    sessionMeta.set(token, { createdAt: Date.now(), ip });
     logEvent("AUTH_SUCCESS", ip, ua, "");
 
     tgSend(`✅ <b>Login Berhasil!</b>\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>\n⏳ Sesi aktif 30 menit`);
@@ -360,76 +365,170 @@ app.get("/api/logs", checkKey, async (req, res) => {
 });
 
 // ─── Telegram Bot Commands ────────────────────────────────────────────────────
-const guard = (msg, fn) => {
-  if (String(msg.chat.id) !== String(CHAT_ID)) return;
+const guard = (m, fn) => {
+  if (String(m.chat.id) !== String(CHAT_ID)) return;
   try { fn(); } catch(e) { console.error("[Bot command] error:", e); }
 };
 
-bot.onText(/\/start/, (msg) => guard(msg, () => tgSend(
-  `🛡️ <b>DriveGuard Bot</b>\n\n` +
-  `/lock — Kunci semua sesi\n/unlock — Buka kunci\n` +
-  `/status — Status sistem\n/log — 10 log terakhir\n` +
-  `/logall — 30 log terakhir\n/fails — IP yang gagal\n` +
-  `/clearfails — Reset fail counter\n/sessions — Sesi aktif`
-)));
+const HELP_TEXT =
+  `🛡️ <b>DriveGuard — Daftar Perintah</b>\n\n` +
+  `<b>🔒 Kontrol Akses</b>\n` +
+  `/lock — Kunci semua sesi secara manual\n` +
+  `/unlock — Buka kunci manual\n` +
+  `/lockauto — Lihat status auto-lock\n\n` +
+  `<b>📊 Monitoring</b>\n` +
+  `/status — Status lengkap sistem\n` +
+  `/sessions — Sesi aktif saat ini\n` +
+  `/log — 10 log terakhir\n` +
+  `/log20 — 20 log terakhir\n` +
+  `/today — Ringkasan hari ini\n` +
+  `/fails — IP yang sering gagal login\n\n` +
+  `<b>⚙️ Pengaturan</b>\n` +
+  `/mute — Matikan notif "Drive Dibuka"\n` +
+  `/unmute — Nyalakan notif lagi\n` +
+  `/clearfails — Reset semua fail counter\n` +
+  `/clearsessions — Hapus semua sesi aktif\n\n` +
+  `<b>🔧 Utilitas</b>\n` +
+  `/ping — Cek server masih hidup\n` +
+  `/uptime — Waktu server sudah berjalan\n` +
+  `/help — Tampilkan pesan ini`;
 
-bot.onText(/\/lock/, (msg) => guard(msg, () => {
-  setManualLock(); activeSessions.clear(); otpStore.clear();
-  logEvent("REMOTE_LOCK", "telegram", "", `by @${msg.from.username}`);
-  tgSend("🔒 <b>Semua sesi dikunci!</b> (permanen sampai /unlock)");
+bot.onText(/\/start|\/help/, (m) => guard(m, () => tgSend(HELP_TEXT)));
+
+// ── Lock / Unlock ──
+bot.onText(/\/lock(?!\w)/, (m) => guard(m, () => {
+  setManualLock(); activeSessions.clear(); otpStore.clear(); sessionMeta.clear();
+  logEvent("REMOTE_LOCK", "telegram", "", `by @${m.from.username}`);
+  tgSend(`🔒 <b>Drive dikunci secara manual</b>\nSemua sesi dihapus. Kirim /unlock untuk membuka kembali.\n⏰ ${fmtTime()}`);
 }));
 
-bot.onText(/\/unlock/, (msg) => guard(msg, () => {
+bot.onText(/\/unlock/, (m) => guard(m, () => {
   clearLock();
-  logEvent("REMOTE_UNLOCK", "telegram", "", `by @${msg.from.username}`);
-  tgSend("🔓 <b>Drive di-unlock!</b> Akses normal kembali.");
+  logEvent("REMOTE_UNLOCK", "telegram", "", `by @${m.from.username}`);
+  tgSend(`🔓 <b>Drive berhasil di-unlock</b>\nAkses normal kembali aktif.\n⏰ ${fmtTime()}`);
 }));
 
-bot.onText(/\/status/, async (msg) => guard(msg, async () => {
-  const total     = (await dbGet("SELECT COUNT(*) as c FROM access_log").catch(()=>null))?.c || 0;
-  const failToday = (await dbGet("SELECT COUNT(*) as c FROM access_log WHERE event LIKE 'AUTH_FAIL%' AND ts > datetime('now','-24 hours')").catch(()=>null))?.c || 0;
-  const okToday   = (await dbGet("SELECT COUNT(*) as c FROM access_log WHERE event='AUTH_SUCCESS' AND ts > datetime('now','-24 hours')").catch(()=>null))?.c || 0;
+bot.onText(/\/lockauto/, (m) => guard(m, () => {
+  if (!globalLocked) return tgSend("✅ Tidak ada lock aktif saat ini.");
   tgSend(
-    `📊 <b>Status DriveGuard</b>\n\n` +
-    `🔒 Global lock: ${globalLocked ? `AKTIF 🔴 (${lockReason === "auto" ? "otomatis, expired 15mnt" : "manual"})` : "tidak aktif 🟢"}\n` +
-    `👤 Sesi aktif: ${activeSessions.size}\n` +
-    `📋 Total log: ${total}\n✅ Sukses 24 jam: ${okToday}\n❌ Gagal 24 jam: ${failToday}\n` +
-    `⏰ ${fmtTime()}\n🖥️ Uptime: ${Math.floor(process.uptime()/60)} menit`
+    `🔴 <b>Status Lock</b>\n\n` +
+    `Tipe: ${lockReason === "auto" ? "Otomatis (terlalu banyak gagal)" : "Manual (/lock)"}\n` +
+    `${lockReason === "auto" ? "⏳ Akan otomatis buka dalam ~15 menit\n   atau ketik /unlock untuk segera buka" : "Kirim /unlock untuk membuka"}`
   );
 }));
 
-const sendLogs = async (limit) => {
-  const rows = await dbAll("SELECT ts,event,ip,detail FROM access_log ORDER BY id DESC LIMIT ?", [limit]).catch(()=>[]);
-  if (!rows.length) return tgSend("Belum ada log.");
-  const icons = { AUTH_SUCCESS:"✅", AUTH_FAIL_PW:"❌", AUTH_FAIL_OTP:"❌", DRIVE_OPENED:"🔔",
-    REMOTE_LOCK:"🔒", REMOTE_UNLOCK:"🔓", AUTH_BLOCKED_LOCKED:"🚫", OTP_SENT:"📨" };
-  const text = rows.map(r =>
-    `${icons[r.event]||"📝"} <code>${r.ts.slice(0,16).replace("T"," ")}</code> ${r.event}\n   IP: <code>${r.ip}</code>${r.detail?" "+r.detail:""}`
-  ).join("\n\n");
-  tgSend(`<b>Log Akses</b>\n\n${text}`);
-};
+// ── Status ──
+bot.onText(/\/status/, async (m) => guard(m, async () => {
+  const [total, fail24, ok24, opens24] = await Promise.all([
+    dbGet("SELECT COUNT(*) c FROM access_log"),
+    dbGet("SELECT COUNT(*) c FROM access_log WHERE event LIKE 'AUTH_FAIL%' AND ts > datetime('now','-24 hours')"),
+    dbGet("SELECT COUNT(*) c FROM access_log WHERE event='AUTH_SUCCESS' AND ts > datetime('now','-24 hours')"),
+    dbGet("SELECT COUNT(*) c FROM access_log WHERE event='DRIVE_OPENED' AND ts > datetime('now','-24 hours')"),
+  ]).then(r => r.map(x => x?.c || 0)).catch(() => [0,0,0,0]);
+  const uptimeSec = Math.floor(process.uptime());
+  const h = Math.floor(uptimeSec/3600), mn = Math.floor((uptimeSec%3600)/60), s = uptimeSec%60;
 
-bot.onText(/\/log$/, (msg)   => guard(msg, () => sendLogs(10)));
-bot.onText(/\/logall/, (msg) => guard(msg, () => sendLogs(30)));
-
-bot.onText(/\/fails/, async (msg) => guard(msg, async () => {
-  const rows = await dbAll("SELECT ip,count,last_fail FROM fail_count ORDER BY count DESC").catch(()=>[]);
-  if (!rows.length) return tgSend("✅ Tidak ada IP yang gagal login.");
-  tgSend(`<b>IP Gagal Login</b>\n\n` +
-    rows.map(r=>`❌ <code>${r.ip}</code> — ${r.count}x\n   Last: ${r.last_fail?.slice(0,16)}`).join("\n\n"));
+  tgSend(
+    `📊 <b>Status DriveGuard</b>\n\n` +
+    `🔒 Lock: ${globalLocked ? `AKTIF 🔴 (${lockReason==="auto"?"otomatis":"manual"})` : "tidak aktif 🟢"}\n` +
+    `🔕 Notif dibuka: ${notifMuted ? "dimatikan 🔕" : "aktif 🔔"}\n` +
+    `👤 Sesi aktif: ${activeSessions.size}\n` +
+    `🔐 OTP pending: ${otpStore.size}\n\n` +
+    `<b>24 jam terakhir:</b>\n` +
+    `🔔 Drive dibuka: ${opens24}x\n` +
+    `✅ Login sukses: ${ok24}x\n` +
+    `❌ Login gagal: ${fail24}x\n\n` +
+    `📋 Total log: ${total}\n` +
+    `🖥️ Uptime: ${h}j ${mn}m ${s}d\n` +
+    `⏰ ${fmtTime()}`
+  );
 }));
 
-bot.onText(/\/clearfails/, async (msg) => guard(msg, async () => {
+// ── Today summary ──
+bot.onText(/\/today/, async (m) => guard(m, async () => {
+  const rows = await dbAll(
+    "SELECT event, COUNT(*) c, MAX(ts) last FROM access_log WHERE ts > datetime('now','start of day') GROUP BY event ORDER BY c DESC"
+  ).catch(() => []);
+  if (!rows.length) return tgSend("Belum ada aktivitas hari ini.");
+  const icons = { AUTH_SUCCESS:"✅", AUTH_FAIL_PW:"❌", AUTH_FAIL_OTP:"❌",
+    DRIVE_OPENED:"🔔", REMOTE_LOCK:"🔒", REMOTE_UNLOCK:"🔓", OTP_SENT:"📨" };
+  const lines = rows.map(r => `${icons[r.event]||"📝"} ${r.event}: <b>${r.c}x</b>`).join("\n");
+  tgSend(`📅 <b>Aktivitas Hari Ini</b>\n\n${lines}\n\n⏰ ${fmtTime()}`);
+}));
+
+// ── Sessions ──
+bot.onText(/\/sessions/, async (m) => guard(m, async () => {
+  if (!activeSessions.size) return tgSend("Tidak ada sesi aktif saat ini.");
+  const lines = [...activeSessions].map(tok => {
+    const meta = sessionMeta.get(tok);
+    const exp  = meta ? Math.max(0, Math.round((meta.exp - Date.now()) / 60000)) : "?";
+    return `🟢 <code>${tok.slice(0,10)}...</code>\n   IP: <code>${meta?.ip||"?"}</code> · exp ${exp} mnt`;
+  });
+  tgSend(`<b>Sesi Aktif (${activeSessions.size})</b>\n\n${lines.join("\n\n")}`);
+}));
+
+bot.onText(/\/clearsessions/, (m) => guard(m, () => {
+  const n = activeSessions.size;
+  activeSessions.clear(); sessionMeta.clear();
+  dbRun("UPDATE sessions SET active=0 WHERE expires > datetime('now')").catch(()=>{});
+  tgSend(`✅ ${n} sesi aktif dihapus. Semua tab Drive harus login ulang.`);
+}));
+
+// ── Logs ──
+const sendLogs = async (limit) => {
+  const rows = await dbAll(
+    "SELECT ts,event,ip,detail FROM access_log ORDER BY id DESC LIMIT ?", [limit]
+  ).catch(()=>[]);
+  if (!rows.length) return tgSend("Belum ada log.");
+  const ico = { AUTH_SUCCESS:"✅", AUTH_FAIL_PW:"❌", AUTH_FAIL_OTP:"❌",
+    DRIVE_OPENED:"🔔", REMOTE_LOCK:"🔒", REMOTE_UNLOCK:"🔓", OTP_SENT:"📨", AUTH_BLOCKED_LOCKED:"🚫" };
+  const text = rows.map(r =>
+    `${ico[r.event]||"📝"} <code>${r.ts.slice(0,16).replace("T"," ")}</code>\n` +
+    `   <code>${r.event}</code> · IP: <code>${r.ip}</code>${r.detail?" · "+r.detail:""}`
+  ).join("\n");
+  tgSend(`<b>Log ${limit} Terakhir</b>\n\n${text}`);
+};
+
+bot.onText(/\/log(?!all|20|\w)/, (m) => guard(m, () => sendLogs(10)));
+bot.onText(/\/log20/, (m)        => guard(m, () => sendLogs(20)));
+
+// ── Fails ──
+bot.onText(/\/fails/, async (m) => guard(m, async () => {
+  const rows = await dbAll("SELECT ip,count,last_fail FROM fail_count ORDER BY count DESC").catch(()=>[]);
+  if (!rows.length) return tgSend("✅ Tidak ada IP yang mencurigakan.");
+  const lines = rows.map(r => `❌ <code>${r.ip}</code> — ${r.count}x gagal\n   Terakhir: ${r.last_fail?.slice(0,16)||"-"}`);
+  tgSend(`<b>🚨 IP Mencurigakan</b>\n\n${lines.join("\n\n")}`);
+}));
+
+bot.onText(/\/clearfails/, async (m) => guard(m, async () => {
   await dbRun("DELETE FROM fail_count").catch(()=>{});
   tgSend("✅ Semua fail counter direset.");
 }));
 
-bot.onText(/\/sessions/, async (msg) => guard(msg, async () => {
-  const rows = await dbAll("SELECT token,created,expires FROM sessions WHERE active=1 AND expires > datetime('now') ORDER BY created DESC").catch(()=>[]);
-  if (!rows.length) return tgSend("Tidak ada sesi aktif.");
-  tgSend(`<b>Sesi Aktif (${rows.length})</b>\n\n` +
-    rows.map(r=>`🟢 <code>${r.token.slice(0,12)}...</code>\n   Dibuat: ${r.created.slice(0,16)}\n   Expires: ${r.expires.slice(0,16)}`).join("\n\n"));
+// ── Mute / Unmute ──
+bot.onText(/\/mute/, (m) => guard(m, () => {
+  notifMuted = true;
+  tgSend("🔕 <b>Notifikasi dibuka Drive dimatikan.</b>\nKamu tidak akan dapat notif setiap ada yang buka Drive.\nAlert gagal login & lock/unlock tetap aktif.\nKetik /unmute untuk nyalakan kembali.");
 }));
+
+bot.onText(/\/unmute/, (m) => guard(m, () => {
+  notifMuted = false;
+  tgSend("🔔 <b>Notifikasi dibuka Drive dinyalakan kembali.</b>");
+}));
+
+// ── Ping ──
+bot.onText(/\/ping/, (m) => guard(m, () => {
+  const start = Date.now();
+  tgSend(`🏓 <b>Pong!</b> (${Date.now()-start}ms)\n⏰ ${fmtTime()}`);
+}));
+
+// ── Uptime ──
+bot.onText(/\/uptime/, (m) => guard(m, () => {
+  const s = Math.floor(process.uptime());
+  const h = Math.floor(s/3600), mn = Math.floor((s%3600)/60), sec = s%60;
+  tgSend(`🖥️ <b>Server Uptime</b>\n${h} jam ${mn} menit ${sec} detik\n⏰ ${fmtTime()}`);
+}));
+
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
