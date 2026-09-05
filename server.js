@@ -5,6 +5,31 @@ const cors       = require("cors");
 const sqlite3    = require("sqlite3").verbose();
 const TelegramBot = require("node-telegram-bot-api");
 const crypto     = require("crypto");
+const fs         = require("fs");
+
+// ─── Cegah lebih dari 1 instance jalan bersamaan ─────────────────────────────
+// Ini penyebab paling umum /lock /unlock "tidak berfungsi": 2 proses node
+// polling Telegram bersamaan bikin update dikirim ke proses yang salah.
+const LOCK_FILE = "/tmp/driveguard-server.pid";
+(function ensureSingleInstance() {
+  if (fs.existsSync(LOCK_FILE)) {
+    const oldPid = parseInt(fs.readFileSync(LOCK_FILE, "utf8"), 10);
+    try {
+      process.kill(oldPid, 0); // cek apakah proses lama masih hidup
+      console.error(`❌ Instance lain sudah jalan (PID ${oldPid}).`);
+      console.error(`   Jalankan: kill ${oldPid}  (atau sudo systemctl stop driveguard)`);
+      console.error(`   Lalu hapus lock: rm ${LOCK_FILE}`);
+      process.exit(1);
+    } catch (e) {
+      // Proses lama sudah mati, lock file basi — lanjut aman
+    }
+  }
+  fs.writeFileSync(LOCK_FILE, String(process.pid));
+  const cleanup = () => { try { fs.unlinkSync(LOCK_FILE); } catch {} process.exit(0); };
+  process.on("exit", () => { try { fs.unlinkSync(LOCK_FILE); } catch {} });
+  process.on("SIGINT", cleanup);
+  process.on("SIGTERM", cleanup);
+})();
 
 // ─── Global safety nets — jangan biarkan proses mati diam-diam ───────────────
 process.on("uncaughtException", (err) => {
@@ -21,7 +46,7 @@ const BOT_TOKEN  = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const CHAT_ID    = (process.env.TELEGRAM_CHAT_ID || "").trim();
 const PW_HASH    = (process.env.PASSWORD_HASH || "").trim();
 const SALT       = "driveguard_salt_v1";
-const MAX_FAILS  = 3;
+const MAX_FAILS  = 2;   // kirim foto mulai percobaan gagal ke-2 (toleransi 1x typo)
 const LOCK_AFTER = 5;
 const OTP_EXPIRY = 2 * 60 * 1000;
 
@@ -31,8 +56,28 @@ if (!API_KEY || !BOT_TOKEN || !CHAT_ID || !PW_HASH) {
 }
 
 // ─── Telegram ─────────────────────────────────────────────────────────────────
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+const bot = new TelegramBot(BOT_TOKEN, { polling: false });
+
+(async () => {
+  try {
+    // Hapus webhook lama & pending updates yang bisa bikin 409 conflict
+    await bot.deleteWebHook({ drop_pending_updates: true });
+    await bot.startPolling();
+    console.log("✅ Telegram bot polling started");
+  } catch (e) {
+    console.error("[Telegram] Gagal start polling:", e.message);
+  }
+})();
+
 bot.on("polling_error", (err) => console.error("[Telegram polling_error]", err.message));
+
+// Debug: log semua pesan masuk supaya bisa cek CHAT_ID cocok atau tidak
+bot.on("message", (msg) => {
+  console.log(`[Telegram IN] chat_id=${msg.chat.id} (expected=${CHAT_ID}) text="${msg.text}"`);
+  if (String(msg.chat.id) !== String(CHAT_ID)) {
+    console.log(`[Telegram] ⚠️  Pesan diabaikan — chat_id tidak cocok dengan TELEGRAM_CHAT_ID di .env`);
+  }
+});
 
 // ─── SQLite ───────────────────────────────────────────────────────────────────
 const db = new sqlite3.Database("driveguard.db");
@@ -116,11 +161,19 @@ const tgSend  = (msg) => bot.sendMessage(CHAT_ID, msg, { parse_mode:"HTML" }).ca
 const tgPhoto = (b64, caption) => {
   try {
     const buf = Buffer.from(b64.replace(/^data:image\/\w+;base64,/,""), "base64");
-    return bot.sendPhoto(CHAT_ID, buf, { caption, parse_mode:"HTML" }).catch(e => console.error("[Telegram] photo failed:", e.message));
+    return bot.sendPhoto(CHAT_ID, buf, { caption, parse_mode:"HTML" },
+      { filename: "capture.jpg", contentType: "image/jpeg" })
+      .catch(e => console.error("[Telegram] photo failed:", e.message));
   } catch (e) {
     console.error("[tgPhoto] error:", e.message);
     return Promise.resolve();
   }
+};
+
+// Kirim foto kalau ada, fallback ke teks kalau tidak ada (kamera diblokir dll)
+const tgMedia = (photo, _mediaType, caption) => {
+  if (photo) return tgPhoto(photo, caption);
+  return tgSend(caption + "\n📷 <i>Foto tidak tersedia (kamera diblokir/tidak ada webcam)</i>");
 };
 
 // ─── Fail tracking ────────────────────────────────────────────────────────────
@@ -144,7 +197,7 @@ app.post("/api/drive-opened", checkKey, async (req, res) => {
     const { ua } = req.body;
     const ip = getIP(req);
     logEvent("DRIVE_OPENED", ip, ua, "");
-    tgSend(`🔔 <b>Drive Dibuka</b>\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>`);
+    tgSend(`🔔 <b>Drive Dibuka</b>\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>\n📱 UA: <code>${(ua||"").slice(0,60)}</code>`);
     res.json({ ok:true, locked:globalLocked });
   } catch (e) {
     console.error("[/api/drive-opened] error:", e);
@@ -154,7 +207,7 @@ app.post("/api/drive-opened", checkKey, async (req, res) => {
 
 app.post("/api/request-otp", authLimiter, checkKey, async (req, res) => {
   try {
-    const { password, photo, ua } = req.body;
+    const { password, photo, mediaType, ua } = req.body;
     const ip = getIP(req);
 
     if (globalLocked) {
@@ -171,8 +224,7 @@ app.post("/api/request-otp", authLimiter, checkKey, async (req, res) => {
       console.log(`[DEBUG] Password mismatch. len=${rawPw.length} computed=${hashPw(rawPw).slice(0,12)}... expected=${PW_HASH.slice(0,12)}...`);
 
       if (fails >= MAX_FAILS) {
-        if (photo) tgPhoto(photo, `🚨 <b>INTRUDER!</b> Gagal login ${fails}x\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>`);
-        else tgSend(`🚨 <b>INTRUDER ALERT!</b> Gagal login ${fails}x\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>\n📷 <i>Foto tidak tersedia</i>`);
+        tgMedia(photo, mediaType, `🚨 <b>INTRUDER ALERT!</b>\nGagal login ${fails}x\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>`);
       }
 
       tgSend(`⚠️ <b>Password Salah #${fails}</b>\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>` +
@@ -185,7 +237,7 @@ app.post("/api/request-otp", authLimiter, checkKey, async (req, res) => {
     const requestId = crypto.randomBytes(16).toString("hex");
     const code      = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = Date.now() + OTP_EXPIRY;
-    otpStore.set(requestId, { code, expiresAt, ip, photo });
+    otpStore.set(requestId, { code, expiresAt, ip, photo, mediaType });
 
     await tgSend(
       `🔐 <b>Kode Verifikasi DriveGuard</b>\n\n<b>🔑 ${code}</b>\n\n` +
@@ -218,8 +270,7 @@ app.post("/api/verify-otp", authLimiter, checkKey, async (req, res) => {
       const fails = await incFail(ip);
       logEvent("AUTH_FAIL_OTP", ip, ua, `fails=${fails}`);
       if (fails >= MAX_FAILS) {
-        if (entry.photo) tgPhoto(entry.photo, `🚨 <b>INTRUDER!</b> OTP salah ${fails}x\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>`);
-        else tgSend(`🚨 <b>INTRUDER!</b> OTP salah ${fails}x\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>`);
+        tgMedia(entry.photo, entry.mediaType, `🚨 <b>INTRUDER!</b> OTP salah ${fails}x\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>`);
       }
       tgSend(`⚠️ <b>OTP Salah #${fails}</b>\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>`);
       if (fails >= LOCK_AFTER) { globalLocked = true; activeSessions.clear(); }
