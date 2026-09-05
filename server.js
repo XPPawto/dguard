@@ -9,14 +9,19 @@ const crypto     = require("crypto");
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT       = process.env.PORT || 3000;
-const API_KEY    = process.env.API_KEY;
-const BOT_TOKEN  = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID    = process.env.TELEGRAM_CHAT_ID;
-const PW_HASH    = process.env.PASSWORD_HASH;
+const API_KEY    = (process.env.API_KEY || "").trim();
+const BOT_TOKEN  = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
+const CHAT_ID    = (process.env.TELEGRAM_CHAT_ID || "").trim();
+const PW_HASH    = (process.env.PASSWORD_HASH || "").trim();
 const SALT       = "driveguard_salt_v1";
 const MAX_FAILS  = 3;
 const LOCK_AFTER = 5;
 const OTP_EXPIRY = 2 * 60 * 1000; // OTP expired setelah 2 menit
+
+if (!API_KEY || !BOT_TOKEN || !CHAT_ID || !PW_HASH) {
+  console.error("❌ .env belum lengkap! Cek API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PASSWORD_HASH");
+  process.exit(1);
+}
 
 // ─── Telegram ─────────────────────────────────────────────────────────────────
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
@@ -111,14 +116,20 @@ app.post("/api/request-otp", authLimiter, checkKey, async (req, res) => {
     return res.json({ ok:false, error:"Akses dikunci oleh admin" });
   }
 
-  const pwOk = hashPw(password) === PW_HASH;
+  const pwOk = hashPw(String(password || "").trim()) === PW_HASH;
 
   if (!pwOk) {
     const fails = await incFail(ip);
     logEvent("AUTH_FAIL_PW", ip, ua, `fails=${fails}`);
+    console.log(`[DEBUG] Password mismatch. Computed=${hashPw(String(password||"").trim()).slice(0,16)}... Expected=${PW_HASH.slice(0,16)}...`);
 
-    if (photo && fails >= MAX_FAILS)
-      tgPhoto(photo, `🚨 <b>INTRUDER!</b> Gagal login ${fails}x\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>`);
+    if (fails >= MAX_FAILS) {
+      if (photo) {
+        tgPhoto(photo, `🚨 <b>INTRUDER!</b> Gagal login ${fails}x\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>`);
+      } else {
+        tgSend(`🚨 <b>INTRUDER ALERT!</b> Gagal login ${fails}x\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>\n📷 <i>Foto tidak tersedia (kamera diblokir/tidak ada webcam)</i>`);
+      }
+    }
 
     tgSend(`⚠️ <b>Password Salah #${fails}</b>\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>` +
       (fails >= LOCK_AFTER ? `\n🔒 <b>Auto-lock aktif!</b>` : ""));
