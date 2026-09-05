@@ -103,8 +103,37 @@ const logEvent = (event, ip, ua, detail) =>
     [new Date().toISOString(), event, ip||"", ua||"", detail||""]).catch(e => console.error("[DB] logEvent failed:", e.message));
 
 // ─── State ────────────────────────────────────────────────────────────────────
-let globalLocked = false;
+let globalLocked   = false;
+let lockReason     = null;   // 'manual' (via /lock, permanen) atau 'auto' (gagal berkali-kali, expired 15 menit)
+let autoUnlockTimer = null;
 const activeSessions = new Set();
+
+function setAutoLock() {
+  globalLocked = true;
+  lockReason   = "auto";
+  activeSessions.clear();
+  clearTimeout(autoUnlockTimer);
+  autoUnlockTimer = setTimeout(() => {
+    if (lockReason === "auto") {
+      globalLocked = false;
+      lockReason = null;
+      tgSend("🔓 <b>Auto-unlock</b>\nKunci sementara (karena banyak percobaan gagal) sudah berakhir setelah 15 menit.");
+      console.log("[AutoUnlock] Lock otomatis dibuka setelah 15 menit");
+    }
+  }, 15 * 60 * 1000);
+}
+
+function setManualLock() {
+  globalLocked = true;
+  lockReason   = "manual";
+  clearTimeout(autoUnlockTimer); // manual lock tidak auto-expire
+}
+
+function clearLock() {
+  globalLocked = false;
+  lockReason   = null;
+  clearTimeout(autoUnlockTimer);
+}
 
 // ─── Simple in-memory rate limiter (ganti express-rate-limit yang bermasalah) ─
 const rateLimitMap = new Map(); // ip -> array of timestamps
@@ -212,7 +241,8 @@ app.post("/api/request-otp", authLimiter, checkKey, async (req, res) => {
 
     if (globalLocked) {
       logEvent("AUTH_BLOCKED_LOCKED", ip, ua, "");
-      return res.json({ ok:false, error:"Akses dikunci oleh admin. Ketik /unlock di bot Telegram." });
+      const untilMsg = lockReason === "auto" ? " (otomatis buka lagi ±15 menit, atau ketik /unlock)" : "";
+      return res.json({ ok:false, locked:true, error:`🔒 Akses sedang dikunci${untilMsg}. Password TIDAK dicek selama terkunci.` });
     }
 
     const rawPw = String(password || "").trim();
@@ -230,7 +260,7 @@ app.post("/api/request-otp", authLimiter, checkKey, async (req, res) => {
       tgSend(`⚠️ <b>Password Salah #${fails}</b>\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>` +
         (fails >= LOCK_AFTER ? `\n🔒 <b>Auto-lock aktif!</b>` : ""));
 
-      if (fails >= LOCK_AFTER) { globalLocked = true; activeSessions.clear(); }
+      if (fails >= LOCK_AFTER) setAutoLock();
       return res.json({ ok:false, error:"Password salah" });
     }
 
@@ -273,7 +303,7 @@ app.post("/api/verify-otp", authLimiter, checkKey, async (req, res) => {
         tgMedia(entry.photo, entry.mediaType, `🚨 <b>INTRUDER!</b> OTP salah ${fails}x\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>`);
       }
       tgSend(`⚠️ <b>OTP Salah #${fails}</b>\n⏰ ${fmtTime()}\n🌐 IP: <code>${ip}</code>`);
-      if (fails >= LOCK_AFTER) { globalLocked = true; activeSessions.clear(); }
+      if (fails >= LOCK_AFTER) setAutoLock();
       return res.json({ ok:false, error:"Kode salah" });
     }
 
@@ -312,13 +342,13 @@ app.post("/api/check-session", checkKey, async (req, res) => {
 });
 
 app.post("/api/remote-lock", checkKey, (req, res) => {
-  globalLocked = true; activeSessions.clear(); otpStore.clear();
+  setManualLock(); activeSessions.clear(); otpStore.clear();
   logEvent("REMOTE_LOCK", getIP(req), "", "via API");
   res.json({ ok:true });
 });
 
 app.post("/api/remote-unlock", checkKey, (req, res) => {
-  globalLocked = false;
+  clearLock();
   logEvent("REMOTE_UNLOCK", getIP(req), "", "via API");
   res.json({ ok:true });
 });
@@ -344,13 +374,13 @@ bot.onText(/\/start/, (msg) => guard(msg, () => tgSend(
 )));
 
 bot.onText(/\/lock/, (msg) => guard(msg, () => {
-  globalLocked = true; activeSessions.clear(); otpStore.clear();
+  setManualLock(); activeSessions.clear(); otpStore.clear();
   logEvent("REMOTE_LOCK", "telegram", "", `by @${msg.from.username}`);
-  tgSend("🔒 <b>Semua sesi dikunci!</b>");
+  tgSend("🔒 <b>Semua sesi dikunci!</b> (permanen sampai /unlock)");
 }));
 
 bot.onText(/\/unlock/, (msg) => guard(msg, () => {
-  globalLocked = false;
+  clearLock();
   logEvent("REMOTE_UNLOCK", "telegram", "", `by @${msg.from.username}`);
   tgSend("🔓 <b>Drive di-unlock!</b> Akses normal kembali.");
 }));
@@ -361,7 +391,7 @@ bot.onText(/\/status/, async (msg) => guard(msg, async () => {
   const okToday   = (await dbGet("SELECT COUNT(*) as c FROM access_log WHERE event='AUTH_SUCCESS' AND ts > datetime('now','-24 hours')").catch(()=>null))?.c || 0;
   tgSend(
     `📊 <b>Status DriveGuard</b>\n\n` +
-    `🔒 Global lock: ${globalLocked?"AKTIF 🔴":"tidak aktif 🟢"}\n` +
+    `🔒 Global lock: ${globalLocked ? `AKTIF 🔴 (${lockReason === "auto" ? "otomatis, expired 15mnt" : "manual"})` : "tidak aktif 🟢"}\n` +
     `👤 Sesi aktif: ${activeSessions.size}\n` +
     `📋 Total log: ${total}\n✅ Sukses 24 jam: ${okToday}\n❌ Gagal 24 jam: ${failToday}\n` +
     `⏰ ${fmtTime()}\n🖥️ Uptime: ${Math.floor(process.uptime()/60)} menit`
